@@ -1,8 +1,9 @@
-
 from pathlib import Path
 import pandas as pd
 import re
 import logging
+from collections import defaultdict
+import calendar  # para calcular último día del mes
 
 # ------------------------------------------------------------------
 # Configuración general
@@ -12,9 +13,9 @@ logging.basicConfig(
     format="%(levelname)s: %(message)s"
 )
 
-RUC = "20470526379"
-INPUT_DIR = Path(".")
-OUTPUT_DIR = INPUT_DIR / "output_txt"
+RUC = "20470526379"  # ← actualízalo si cambia tu número de RUC
+INPUT_DIR = Path(".")              # carpeta donde pones los Excel
+OUTPUT_DIR = INPUT_DIR / "output_txt"  # carpeta destino de los .TXT PLE
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 MESES = {
@@ -24,7 +25,7 @@ MESES = {
 }
 
 # ------------------------------------------------------------------
-# Utilidades
+# Utilidades genéricas
 # ------------------------------------------------------------------
 
 def extraer_mes_archivo(nombre: str) -> str | None:
@@ -35,12 +36,13 @@ def extraer_mes_archivo(nombre: str) -> str | None:
     return None
 
 
+def ultimo_dia_mes(anno: int, mes: int) -> int:
+    """Devuelve el último día (28‑31) para *mes* y *anno*."""
+    return calendar.monthrange(anno, mes)[1]
+
+
 def normalizar_codigo(codigo) -> str:
-    """Convierte el código de cuenta a string limpio y en mayúsculas.
-    - Convierte floats como 4001.0 en "4001".
-    - Elimina espacios y relleno.
-    - Devuelve string vacío si el valor es NaN / None.
-    """
+    """Convierte el código de cuenta a string limpio y en mayúsculas."""
     if pd.isna(codigo):
         return ""
     if isinstance(codigo, float) and codigo.is_integer():
@@ -50,11 +52,11 @@ def normalizar_codigo(codigo) -> str:
 
 def canon(col: str) -> str:
     """Normaliza nombres de columnas (minúsculas, 1 espacio entre palabras)."""
-    return re.sub(r"\s+", " ", col.lower()).strip()
+    return re.sub(r"\s+", " ", str(col).lower()).strip()
 
 
 def buscar_columna(df: pd.DataFrame, *keywords: str) -> str | None:
-    """Devuelve el primer nombre de columna que contenga todos los *keywords* (canon)."""
+    """Devuelve el primer nombre de columna que contenga *todos* los keywords (canon)."""
     kws = [canon(k) for k in keywords]
     for original in df.columns:
         c = canon(original)
@@ -63,100 +65,171 @@ def buscar_columna(df: pd.DataFrame, *keywords: str) -> str | None:
     return None
 
 # ------------------------------------------------------------------
+#  Parseo de Transaction Reference  →  (serie, número)
+# ------------------------------------------------------------------
+
+def parse_doc(ref_raw: str) -> tuple[str, str]:
+    """Extrae serie y número desde Transaction Reference (normalizado)."""
+    if pd.isna(ref_raw):
+        return "", ""
+    ref = str(ref_raw).strip().upper()
+    if not ref:
+        return "", ""
+
+    ref = ref.replace("/", "-").replace(" ", "-")
+
+    # Patrón SERIE-NUMERO  (F001-5068, B123-45, etc.)
+    m = re.match(r"^([A-Z0-9]{1,10})[-](\d{1,20})$", ref)
+    if m:
+        return m.group(1), m.group(2).lstrip("0") or "0"
+
+    # Patrón compacto F0015068
+    m = re.match(r"^([A-Z]{1}\d{3})(\d{1,20})$", ref)
+    if m:
+        return m.group(1), m.group(2).lstrip("0") or "0"
+
+    # Solo dígitos → asumimos sin serie
+    if ref.isdigit():
+        return "", ref.lstrip("0") or "0"
+
+    return "", ""
+
+# ------------------------------------------------------------------
 # Procesamiento principal
 # ------------------------------------------------------------------
 
 def procesar_excel(archivo: Path) -> None:
     logging.info(f"Procesando {archivo.name}")
-    nombre_archivo = archivo.stem
-    mes = extraer_mes_archivo(nombre_archivo)
+    mes = extraer_mes_archivo(archivo.stem)
     if not mes:
         logging.warning("No se pudo detectar el mes en el nombre de archivo – se omite.")
         return
 
     try:
         xls = pd.ExcelFile(archivo)
-        diario_df = xls.parse(sheet_name=4)  # Libro Diario
-        pc_df = xls.parse(sheet_name=5)      # Plan de Cuentas
+        diario_df = xls.parse(sheet_name=4)  # Hoja 5: Libro Diario
+        pc_df     = xls.parse(sheet_name=5)  # Hoja 6: Plan de Cuentas
     except Exception as e:
         logging.error(f"Error leyendo hojas: {e}")
         return
 
-    # Normalizar encabezados solo para búsquedas (no modificamos los nombres originales)
     diario_df.columns = [str(c) for c in diario_df.columns]
-    pc_df.columns = [str(c) for c in pc_df.columns]
+    pc_df.columns     = [str(c) for c in pc_df.columns]
 
-    # -------------------------
-    # PLAN DE CUENTAS
-    # -------------------------
+    # ---------------- Plan de cuentas ----------------
+    col_cuenta_pc     = buscar_columna(pc_df, "cuenta peruana") or pc_df.columns[2]
+
+    # Tomar "Nombre de Cuenta Contable" (preferencia por encabezado; fallback a columna D)
+    col_nombre_cuenta = (
+        buscar_columna(pc_df, "nombre", "cuenta", "contable")
+        or (pc_df.columns[3] if len(pc_df.columns) > 3 else pc_df.columns[1])
+    )
+    logging.info(f"Plan de Cuentas: usando columna de NOMBRE = '{col_nombre_cuenta}'")
+
     pc_df = pc_df.fillna("")
-    col_cuenta_pc = buscar_columna(pc_df, "cuenta peruana") or pc_df.columns[2]
     pc_df["codigo_cuenta"] = pc_df[col_cuenta_pc].map(normalizar_codigo)
-    col_nombre_cuenta = pc_df.columns[1]
-
     pc_df = pc_df[pc_df["codigo_cuenta"] != ""]
 
-    # -------------------------
-    # LIBRO DIARIO – localización columnas clave
-    # -------------------------
+    # ---------------- Libro Diario ----------------
     col_cuenta_diario = buscar_columna(diario_df, "cuenta peruana")
-    if not col_cuenta_diario:
-        logging.error("No se halló columna de cuenta contable en Diario.")
+    col_fecha         = buscar_columna(diario_df, "transaction date")
+
+    # Glosa: preferimos "Description.1" (AA); si no, "Description" genérica.
+    col_glosa = "Description.1" if "Description.1" in diario_df.columns else buscar_columna(diario_df, "description")
+
+    col_debe_credit   = buscar_columna(diario_df, "debit/credit")
+    col_monto         = buscar_columna(diario_df, "transaction amount") or buscar_columna(diario_df, "base amount")
+    col_journal_num   = buscar_columna(diario_df, "journal number")
+    col_journal_type  = buscar_columna(diario_df, "journal type")
+    col_currency      = buscar_columna(diario_df, "transaction currency code")
+    col_ref_doc       = buscar_columna(diario_df, "transaction reference")
+
+    required = [col_cuenta_diario, col_fecha, col_glosa, col_monto, col_journal_num, col_journal_type]
+    if any(c is None for c in required):
+        logging.error("Faltan columnas requeridas en Diario – verifica nombres.")
+        logging.error("Columnas detectadas → cuenta=%s, fecha=%s, glosa=%s, monto=%s, jnum=%s, jtype=%s",
+                      col_cuenta_diario, col_fecha, col_glosa, col_monto, col_journal_num, col_journal_type)
+        logging.info("Encabezados disponibles en Diario: %s", list(diario_df.columns))
         return
 
-    col_fecha = buscar_columna(diario_df, "transaction date") or buscar_columna(diario_df, "date")
-    col_glosa = buscar_columna(diario_df, "description")
-    col_debe = buscar_columna(diario_df, "debit/credit")  # Usamos signo para determinar
-    col_monto = buscar_columna(diario_df, "transaction amount") or buscar_columna(diario_df, "base amount")
-    col_journal_number = buscar_columna(diario_df, "journal number")
-    col_journal_type = buscar_columna(diario_df, "journal type")
+    # Año de trabajo (deducido del nombre o fijo 2020 aquí)
+    ANIO = 2020
+    dia_final = ultimo_dia_mes(ANIO, int(mes))
+    periodo_plan = f"{ANIO}{mes}{dia_final:02d}"   # 20200131 para plan de cuentas
+    periodo_diario = f"{ANIO}{mes}00"              # 20200100 para libro diario (regla SUNAT)
 
-    if None in [col_fecha, col_glosa, col_debe, col_monto, col_journal_number, col_journal_type]:
-        logging.error("Faltan columnas requeridas en Diario.")
-        return
-
-    # ♦ Tipo / serie / número de comprobante
-    col_tipo_doc = buscar_columna(diario_df, "tipo de documento")
-    col_serie_doc = buscar_columna(diario_df, "serie") or buscar_columna(diario_df, "journal source")
-    col_num_doc = buscar_columna(diario_df, "numero del comprobante") or buscar_columna(diario_df, "transaction reference")
-
-    periodo_ple = f"2020{mes}00"
-
-    # -------------------------
-    # Generación líneas Libro Diario 5.1
-    # -------------------------
     diario_lines = []
-    cuo_cache: dict[str, int] = {}
+    correlativos_tipo: defaultdict[str, int] = defaultdict(int)
+    cuentas_validas = set(pc_df["codigo_cuenta"].values)
 
     for _, row in diario_df.iterrows():
         cuenta = normalizar_codigo(row[col_cuenta_diario])
-        if cuenta == "" or cuenta not in set(pc_df["codigo_cuenta" ].values):
+        if cuenta == "" or cuenta not in cuentas_validas:
             continue
 
-        # CUO = tipo + número (sin decimales)
         j_type = str(row[col_journal_type]).strip().upper()
-        j_number_raw = str(row[col_journal_number]).split(".")[0]
-        cuo = f"{j_type}{j_number_raw}"
+        correlativos_tipo[j_type] += 1
+        cuo = f"{j_type}{correlativos_tipo[j_type]:03d}"
 
-        # Correlativo interno M1/M2…
-        idx = cuo_cache.get(cuo, 0) + 1
-        cuo_cache[cuo] = idx
-        correlativo = f"M{idx}"
+        # ---------------- Correlativo (M + JournalNumber) -------------
+        jnum_raw = row[col_journal_num]
+        jnum_str = "" if pd.isna(jnum_raw) else str(jnum_raw).rstrip(".0")
+        correlativo = f"M{jnum_str}"
 
-        # Fechas y montos
-        fecha_oper = pd.to_datetime(row[col_fecha])
-        fecha_str = fecha_oper.strftime("%d/%m/%Y") if not pd.isna(fecha_oper) else ""
+        # Fecha original de la línea
+        fecha_oper = pd.to_datetime(row[col_fecha], errors="coerce")
+        dia_target = dia_final
+        fecha_target_str = f"{dia_target:02d}/{mes}/{ANIO}"
 
-        monto = float(row[col_monto] or 0)
-        if str(row[col_debe]).strip().upper().startswith("D") or monto > 0:
-            debe = monto
-            haber = 0
+        # ---------------- Estado + Fecha según reglas ----------------
+        estado = "1"  # default
+        if pd.isna(fecha_oper):
+            fecha_str = fecha_target_str
         else:
-            debe = 0
-            haber = abs(monto)
+            if fecha_oper.year == ANIO:
+                if fecha_oper.month < int(mes):
+                    estado = "8"  # periodo anterior
+                    fecha_str = fecha_oper.strftime("%d/%m/%Y")
+                elif fecha_oper.month == int(mes):
+                    estado = "1"  # mismo periodo
+                    fecha_str = fecha_oper.strftime("%d/%m/%Y")
+                else:  # mes futuro dentro del mismo año
+                    estado = "1"
+                    fecha_str = fecha_target_str
+            else:  # otro año -> estado 8
+                estado = "8"
+                fecha_str = fecha_oper.strftime("%d/%m/%Y")
 
-        # Tipo de comprobante heurístico
-        serie_doc = str(row.get(col_serie_doc, "")).strip().upper() if col_serie_doc else ""
+        # Montos – Debe / Haber
+        try:
+            monto_raw = float(row.get(col_monto, 0))
+        except ValueError:
+            monto_raw = 0.0
+
+        if col_debe_credit:
+            flag = str(row[col_debe_credit]).strip().upper()
+            if flag.startswith("D"):
+                debe, haber = abs(monto_raw), 0.0
+            elif flag.startswith("C"):
+                debe, haber = 0.0, abs(monto_raw)
+            else:
+                debe, haber = (monto_raw, 0.0) if monto_raw > 0 else (0.0, abs(monto_raw))
+        else:
+            debe, haber = (monto_raw, 0.0) if monto_raw > 0 else (0.0, abs(monto_raw))
+
+        # Moneda (Transaction Currency Code)
+        moneda = "PEN"
+        if col_currency:
+            moneda_val = str(row.get(col_currency, "")).strip().upper()
+            if moneda_val.startswith("USD"):
+                moneda = "USD"
+            elif moneda_val.startswith("PEN") or moneda_val.startswith("SOL"):
+                moneda = "PEN"
+            elif moneda_val:
+                moneda = moneda_val[:3]
+
+        # Tipo, serie y número de comprobante
+        serie_doc, num_doc = parse_doc(row.get(col_ref_doc, "")) if col_ref_doc else ("", "")
         if serie_doc.startswith("F"):
             tipo_cmp = "01"
         elif serie_doc.startswith("B"):
@@ -166,62 +239,52 @@ def procesar_excel(archivo: Path) -> None:
         else:
             tipo_cmp = "00"
 
-        num_doc = str(row.get(col_num_doc, "")).strip().upper() if col_num_doc else ""
+        glosa_val = str(row.get(col_glosa, "")).strip()
 
         line = [
-            periodo_ple,         # 1  Periodo
-            cuo,                 # 2  CUO
-            correlativo,         # 3  Correlativo
-            cuenta,              # 4  Cuenta contable
-            "",                 # 5  Unidad Operación (vacío)
-            "",                 # 6  Centro costos (vacío)
-            "PEN",              # 7  Moneda (harcode PEN, ajusta si usas otra)
-            "", "",            # 8‑9  tipo/num doc Identidad emisor (vacío)
-            tipo_cmp,            # 10 Tipo Comprobante
-            serie_doc,           # 11 Serie
-            num_doc,             # 12 Número Doc
-            fecha_str,           # 13 Fecha contable
-            "",                 # 14 Fecha vencimiento
-            fecha_str,           # 15 Fecha operación
-            str(row[col_glosa])[:200],  # 16 Glosa
-            "",                 # 17 Glosa referencial
-            f"{debe:.2f}",      # 18 Debe
-            f"{haber:.2f}",     # 19 Haber
-            "",                 # 20 Dato Estructurado (ventas/compras)
-            "1"                 # 21 Estado (1 vigente)
+            periodo_diario,  # 1 – Periodo (libro diario con 00)
+            cuo,            # 2 – CUO
+            correlativo,    # 3 – Correlativo
+            cuenta,         # 4 – Cuenta contable
+            "", "",        # 5‑6 – subcuenta / CCosto (vacío)
+            moneda,         # 7 – Moneda
+            "", "",        # 8‑9 – TC y glosa TC (vacío)
+            tipo_cmp,       # 10 – Tipo de Comprobante
+            serie_doc,      # 11 – Serie
+            num_doc,        # 12 – Número
+            "", "",         # 13‑14 – Doc ref (vacío)
+            fecha_str,      # 15 – Fecha
+            glosa_val,      # 16 – Glosa
+            "",             # 17 – Código libro (vacío)
+            f"{debe:.2f}",  # 18 – Debe
+            f"{haber:.2f}", # 19 – Haber
+            "",             # 20 – Campo libre
+            estado          # 21 – Estado
         ]
-        diario_lines.append("|".join(line))
+        diario_lines.append("|".join(line) + "|")
 
-    archivo_diario = OUTPUT_DIR / f"LE{RUC}2020{mes}00050100001111.txt"
+    # ----------------‑‑ Guardado archivos ----------------
+    archivo_diario = OUTPUT_DIR / f"LE{RUC}{ANIO}{mes}00050100001111.txt"
     archivo_diario.write_text("\n".join(diario_lines), encoding="utf-8")
-    logging.info(f"Libro Diario generado → {archivo_diario}  líneas: {len(diario_lines)}")
+    logging.info(f"Diario PLE → {archivo_diario.name}  (líneas: {len(diario_lines)})")
 
-    # -------------------------
-    # Plan de Cuentas 6.1 (filtrado a las usadas)
-    # -------------------------
-    cuentas_usadas = set(canon(c) for c in diario_df[col_cuenta_diario].map(normalizar_codigo))
-    pc_filtrado = pc_df[pc_df["codigo_cuenta"].isin(cuentas_usadas)]
-
+    # ----- Plan de Cuentas (usa periodo con día final) -----
     plan_lines = []
-    for _, row in pc_filtrado.iterrows():
+    for _, row in pc_df.iterrows():
+        cuenta = row["codigo_cuenta"]
+        nombre = str(row.get(col_nombre_cuenta, "")).strip()
         line = [
-            periodo_ple,
-            row["codigo_cuenta"],
-            str(row[col_nombre_cuenta]).strip()[:200],
-            "01",  # Código PCGE (asumido)
-            "", "", "",  # campos vacíos
-            "1",   # Estado 1
-            ""      # libre
+            periodo_plan, cuenta, nombre, "01", "", "", "", "1", ""
         ]
-        plan_lines.append("|".join(line))
+        plan_lines.append("|".join(line) + "|")
 
-    archivo_plan = OUTPUT_DIR / f"LE{RUC}2020{mes}00060300001111.txt"
+    archivo_plan = OUTPUT_DIR / f"LE{RUC}{ANIO}{mes}00050300001111.txt"
     archivo_plan.write_text("\n".join(plan_lines), encoding="utf-8")
-    logging.info(f"Plan de Cuentas generado → {archivo_plan}  líneas: {len(plan_lines)}")
+    logging.info(f"Plan de Ctas PLE → {archivo_plan.name}  (líneas: {len(plan_lines)})")
     logging.info("------------------------------------------------------------\n")
 
 # ------------------------------------------------------------------
-# Ejecución
+# Búsqueda de archivos y ejecución
 # ------------------------------------------------------------------
 
 def main():
@@ -230,6 +293,7 @@ def main():
         logging.warning("No se encontraron archivos con patrón 'DIARIO,*2020_2.xlsx'")
     for archivo in archivos:
         procesar_excel(archivo)
+
 
 if __name__ == "__main__":
     main()
