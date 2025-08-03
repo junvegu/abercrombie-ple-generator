@@ -92,7 +92,7 @@ def parse_doc(ref_raw: str) -> tuple[str, str]:
     if ref.isdigit():
         return "", ref.lstrip("0") or "0"
 
-    return "", ""
+    return "", "0"
 
 # ------------------------------------------------------------------
 # Procesamiento principal
@@ -129,6 +129,21 @@ def procesar_excel(archivo: Path) -> None:
     pc_df = pc_df.fillna("")
     pc_df["codigo_cuenta"] = pc_df[col_cuenta_pc].map(normalizar_codigo)
     pc_df = pc_df[pc_df["codigo_cuenta"] != ""]
+
+    # ------------------ eliminar duplicados de código de cuenta ------------------
+    # preferir nombre más largo si hay múltiples registros para un mismo código
+    pc_df["nombre_temp"] = pc_df.get(col_nombre_cuenta, "").astype(str).fillna("").str.strip()
+    before = len(pc_df)
+    # ordenar para que el nombre más descriptivo (más largo) quede primero
+    pc_df["name_len"] = pc_df["nombre_temp"].str.len()
+    pc_df = (
+        pc_df.sort_values(by=["codigo_cuenta", "name_len"], ascending=[True, False])
+             .drop_duplicates(subset=["codigo_cuenta"], keep="first")
+    )
+    after = len(pc_df)
+    logging.info(f"Plan de Cuentas: removidos {before - after} duplicados de código de cuenta (quedan {after}).")
+    # limpiar columnas auxiliares
+    pc_df = pc_df.drop(columns=["nombre_temp", "name_len"] )
 
     # ---------------- Libro Diario ----------------
     col_cuenta_diario = buscar_columna(diario_df, "cuenta peruana")
@@ -168,6 +183,8 @@ def procesar_excel(archivo: Path) -> None:
             continue
 
         j_type = str(row[col_journal_type]).strip().upper()
+
+        # --- CUO agrupar mínimo (puedes refinar después) ---
         correlativos_tipo[j_type] += 1
         cuo = f"{j_type}{correlativos_tipo[j_type]:03d}"
 
@@ -181,24 +198,31 @@ def procesar_excel(archivo: Path) -> None:
         dia_target = dia_final
         fecha_target_str = f"{dia_target:02d}/{mes}/{ANIO}"
 
-        # ---------------- Estado + Fecha según reglas ----------------
-        estado = "1"  # default
+        # ---------------- Estado + Fecha + Periodo por línea según reglas ----------------
+        estado = "1"
+        periodo_linea = periodo_diario
         if pd.isna(fecha_oper):
             fecha_str = fecha_target_str
         else:
             if fecha_oper.year == ANIO:
                 if fecha_oper.month < int(mes):
-                    estado = "8"  # periodo anterior
+                    estado = "8"
                     fecha_str = fecha_oper.strftime("%d/%m/%Y")
+                    periodo_linea = f"{ANIO}{fecha_oper.month:02d}00"
                 elif fecha_oper.month == int(mes):
-                    estado = "1"  # mismo periodo
+                    estado = "1"
                     fecha_str = fecha_oper.strftime("%d/%m/%Y")
-                else:  # mes futuro dentro del mismo año
+                else:
                     estado = "1"
                     fecha_str = fecha_target_str
-            else:  # otro año -> estado 8
-                estado = "8"
-                fecha_str = fecha_oper.strftime("%d/%m/%Y")
+            else:
+                if fecha_oper.year < ANIO:
+                    estado = "8"
+                    fecha_str = fecha_oper.strftime("%d/%m/%Y")
+                    periodo_linea = f"{fecha_oper.year}{fecha_oper.month:02d}00"
+                else:
+                    estado = "1"
+                    fecha_str = fecha_target_str
 
         # Montos – Debe / Haber
         try:
@@ -239,16 +263,21 @@ def procesar_excel(archivo: Path) -> None:
         else:
             tipo_cmp = "00"
 
+        # Si falta número cuando el tipo es válido, se rellena con '0' (campo obligatorio)
+        if tipo_cmp != "00" and not num_doc:
+            logging.warning(f"Comprobante tipo {tipo_cmp} sin número: se pondrá '0' de fallback.")
+            num_doc = "0"
+
         glosa_val = str(row.get(col_glosa, "")).strip()
 
         line = [
-            periodo_diario,  # 1 – Periodo (libro diario con 00)
+            periodo_linea,  # 1 – Periodo ajustado por línea
             cuo,            # 2 – CUO
             correlativo,    # 3 – Correlativo
             cuenta,         # 4 – Cuenta contable
-            "", "",        # 5‑6 – subcuenta / CCosto (vacío)
+            "", "",         # 5‑6 – subcuenta / CCosto (vacío)
             moneda,         # 7 – Moneda
-            "", "",        # 8‑9 – TC y glosa TC (vacío)
+            "", "",         # 8‑9 – TC y glosa TC (vacío)
             tipo_cmp,       # 10 – Tipo de Comprobante
             serie_doc,      # 11 – Serie
             num_doc,        # 12 – Número
@@ -262,7 +291,6 @@ def procesar_excel(archivo: Path) -> None:
             estado          # 21 – Estado
         ]
         diario_lines.append("|".join(line) + "|")
-
     # ----------------‑‑ Guardado archivos ----------------
     archivo_diario = OUTPUT_DIR / f"LE{RUC}{ANIO}{mes}00050100001111.txt"
     archivo_diario.write_text("\n".join(diario_lines), encoding="utf-8")
