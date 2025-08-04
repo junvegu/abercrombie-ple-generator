@@ -71,10 +71,10 @@ def buscar_columna(df: pd.DataFrame, *keywords: str) -> str | None:
 def parse_doc(ref_raw: str) -> tuple[str, str]:
     """Extrae serie y número desde Transaction Reference (normalizado)."""
     if pd.isna(ref_raw):
-        return "", ""
+        return "", "0"
     ref = str(ref_raw).strip().upper()
     if not ref:
-        return "", ""
+        return "", "0"
 
     ref = ref.replace("/", "-").replace(" ", "-")
 
@@ -153,7 +153,7 @@ def procesar_excel(archivo: Path) -> None:
     col_glosa = "Description.1" if "Description.1" in diario_df.columns else buscar_columna(diario_df, "description")
 
     col_debe_credit   = buscar_columna(diario_df, "debit/credit")
-    col_monto         = buscar_columna(diario_df, "transaction amount") or buscar_columna(diario_df, "base amount")
+    col_monto = buscar_columna(diario_df, "base amount") or buscar_columna(diario_df, "transaction amount")
     col_journal_num   = buscar_columna(diario_df, "journal number")
     col_journal_type  = buscar_columna(diario_df, "journal type")
     col_currency      = buscar_columna(diario_df, "transaction currency code")
@@ -176,6 +176,8 @@ def procesar_excel(archivo: Path) -> None:
     diario_lines = []
     correlativos_tipo: defaultdict[str, int] = defaultdict(int)
     cuentas_validas = set(pc_df["codigo_cuenta"].values)
+    total_debe_sum = 0.0
+    total_haber_sum = 0.0
 
     for _, row in diario_df.iterrows():
         cuenta = normalizar_codigo(row[col_cuenta_diario])
@@ -191,7 +193,8 @@ def procesar_excel(archivo: Path) -> None:
         # ---------------- Correlativo (M + JournalNumber) -------------
         jnum_raw = row[col_journal_num]
         jnum_str = "" if pd.isna(jnum_raw) else str(jnum_raw).rstrip(".0")
-        correlativo = f"M{jnum_str}"
+        prefix = "A" if col_ref_doc and isinstance(row.get(col_ref_doc, ""), str) and "APERTURA" in str(row.get(col_ref_doc, "")).upper() else "M"
+        correlativo = f"{prefix}{jnum_str}"
 
         # Fecha original de la línea
         fecha_oper = pd.to_datetime(row[col_fecha], errors="coerce")
@@ -224,22 +227,17 @@ def procesar_excel(archivo: Path) -> None:
                     estado = "1"
                     fecha_str = fecha_target_str
 
-        # Montos – Debe / Haber
+        # Montos – Debe / Haber: usar solo base amount (positivo -> debe, negativo -> haber)
         try:
             monto_raw = float(row.get(col_monto, 0))
         except ValueError:
             monto_raw = 0.0
-
-        if col_debe_credit:
-            flag = str(row[col_debe_credit]).strip().upper()
-            if flag.startswith("D"):
-                debe, haber = abs(monto_raw), 0.0
-            elif flag.startswith("C"):
-                debe, haber = 0.0, abs(monto_raw)
-            else:
-                debe, haber = (monto_raw, 0.0) if monto_raw > 0 else (0.0, abs(monto_raw))
+        if monto_raw >= 0:
+            debe, haber = monto_raw, 0.0
         else:
-            debe, haber = (monto_raw, 0.0) if monto_raw > 0 else (0.0, abs(monto_raw))
+            debe, haber = 0.0, abs(monto_raw)
+        total_debe_sum += debe
+        total_haber_sum += haber
 
         # Moneda (Transaction Currency Code)
         moneda = "PEN"
@@ -292,10 +290,36 @@ def procesar_excel(archivo: Path) -> None:
         ]
         diario_lines.append("|".join(line) + "|")
     # ----------------‑‑ Guardado archivos ----------------
+      # ------------------ Guardado archivos ----------------
+    # resumen por estado y totales (simula control de SUNAT)
+    from collections import defaultdict as _defaultdict
+
+    estado_counts: dict[str,int] = {}
+    total_debe_estado: dict[str, float] = _defaultdict(float)
+    total_haber_estado: dict[str, float] = _defaultdict(float)
+
+    for l in diario_lines:
+        parts = l.rstrip("\n").split("|")
+        if len(parts) < 22:
+            continue
+        est = parts[21]
+        estado_counts[est] = estado_counts.get(est, 0) + 1
+        try:
+            debe_line = float(parts[17]) if parts[17] else 0.0
+            haber_line = float(parts[18]) if parts[18] else 0.0
+        except ValueError:
+            continue
+        total_debe_estado[est] += debe_line
+        total_haber_estado[est] += haber_line
+
+    logging.info(f"Conteo estados Libro Diario: {estado_counts}")
+    for est in sorted(total_debe_estado.keys()):
+        logging.info(f"Totales por estado {est}: Debe={total_debe_estado[est]:.2f} Haber={total_haber_estado[est]:.2f}")
+    logging.info(f"Totales Libro Diario: Debe={total_debe_sum:.2f} Haber={total_haber_sum:.2f}")
+
     archivo_diario = OUTPUT_DIR / f"LE{RUC}{ANIO}{mes}00050100001111.txt"
     archivo_diario.write_text("\n".join(diario_lines), encoding="utf-8")
     logging.info(f"Diario PLE → {archivo_diario.name}  (líneas: {len(diario_lines)})")
-
     # ----- Plan de Cuentas (usa periodo con día final) -----
     plan_lines = []
     for _, row in pc_df.iterrows():
